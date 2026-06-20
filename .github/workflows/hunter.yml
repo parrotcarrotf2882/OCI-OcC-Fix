@@ -24,7 +24,7 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-            - name: Write config files
+      - name: Write config files
         run: |
           printf '%s' "${{ secrets.OCI_CONFIG }}" > config
           printf '%s' "${{ secrets.OCI_PRIVATE_KEY }}" > oci_private_key.pem
