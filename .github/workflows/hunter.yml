@@ -1,50 +1,180 @@
 name: Oracle A1 Hunter
 
 on:
-  workflow_dispatch:
-  schedule:
-    - cron: "7 */6 * * *"
+workflow_dispatch:
+schedule:
+- cron: "7 */6 * * *"
+
+permissions:
+contents: write
 
 concurrency:
-  group: oracle-a1-hunter
-  cancel-in-progress: false
+group: oracle-a1-hunter
+cancel-in-progress: false
 
 jobs:
-  hunt:
-    runs-on: ubuntu-latest
-    timeout-minutes: 355
+hunt:
+runs-on: ubuntu-latest
+timeout-minutes: 355
 
-    steps:
-      - uses: actions/checkout@v4
+steps:
+  - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.10"
+  - name: Check completion flag
+    id: done
+    run: |
+      if [ -f instance_created.flag ]; then
+        echo "created=true" >> "$GITHUB_OUTPUT"
+        echo "Instance already created earlier. Skipping."
+      else
+        echo "created=false" >> "$GITHUB_OUTPUT"
+      fi
 
-      - name: Install dependencies
-        run: pip install -r requirements.txt
+  - uses: actions/setup-python@v5
+    if: steps.done.outputs.created != 'true'
+    with:
+      python-version: "3.10"
 
-      - name: Write config files
-        env:
-          OCI_CONFIG_SECRET: ${{ secrets.OCI_CONFIG }}
-          OCI_PRIVATE_KEY_SECRET: ${{ secrets.OCI_PRIVATE_KEY }}
-          CONFIGURATION_INI_SECRET: ${{ secrets.CONFIGURATION_INI }}
-        run: |
-          printf '%s\n' "$OCI_CONFIG_SECRET" > config
-          printf '%s\n' "$OCI_PRIVATE_KEY_SECRET" > oci_private_key.pem
-          printf '%s\n' "$CONFIGURATION_INI_SECRET" > configuration.ini
-          chmod 600 oci_private_key.pem
+  - name: Install dependencies
+    if: steps.done.outputs.created != 'true'
+    run: pip install -r requirements.txt
 
-      - name: Debug availability_domains
-        run: |
-          python3 - <<'PY'
-          import configparser, json
-          cfg = configparser.ConfigParser()
-          cfg.read("configuration.ini")
-          v = cfg.get("OCI", "availability_domains")
-          print("availability_domains repr:", repr(v))
-          print("availability_domains parsed:", json.loads(v))
-          PY
+  - name: Write config files
+    if: steps.done.outputs.created != 'true'
+    env:
+      OCI_CONFIG_SECRET: ${{ secrets.OCI_CONFIG }}
+      OCI_PRIVATE_KEY_SECRET: ${{ secrets.OCI_PRIVATE_KEY }}
+      CONFIGURATION_INI_SECRET: ${{ secrets.CONFIGURATION_INI }}
+    run: |
+      printf '%s\n' "$OCI_CONFIG_SECRET" > config
+      printf '%s\n' "$OCI_PRIVATE_KEY_SECRET" > oci_private_key.pem
+      printf '%s\n' "$CONFIGURATION_INI_SECRET" > configuration.ini
+      chmod 600 oci_private_key.pem
 
-      - name: Run hunter
-        run: python3 bot.py
+  - name: Read previous attempt counter
+    if: steps.done.outputs.created != 'true'
+    run: |
+      if [ -f attempt_count.txt ] && grep -Eq '^[0-9]+$' attempt_count.txt; then
+        PREV_ATTEMPTS=$(cat attempt_count.txt)
+      else
+        PREV_ATTEMPTS=0
+      fi
+
+      echo "PREV_ATTEMPTS=$PREV_ATTEMPTS" >> "$GITHUB_ENV"
+      echo "Previous failed attempts: $PREV_ATTEMPTS"
+
+  - name: Run hunter time slice
+    if: steps.done.outputs.created != 'true'
+    run: |
+      set +e
+      timeout 21000s python3 bot.py 2>&1 | tee bot_run.log
+      CODE=${PIPESTATUS[0]}
+      echo "BOT_EXIT_CODE=$CODE" >> "$GITHUB_ENV"
+      echo "Bot exit code: $CODE"
+      exit 0
+
+  - name: Update counter and notify
+    if: steps.done.outputs.created != 'true'
+    env:
+      PREV_ATTEMPTS: ${{ env.PREV_ATTEMPTS }}
+    run: |
+      python3 - <<'PY'
+      import configparser
+      import os
+      import re
+      import urllib.parse
+      import urllib.request
+
+      prev_attempts = int(os.environ.get("PREV_ATTEMPTS", "0"))
+
+      try:
+          with open("bot_run.log", "r", encoding="utf-8", errors="replace") as f:
+              log = f.read()
+      except FileNotFoundError:
+          log = ""
+
+      fails_this_run = log.count("Create failed in")
+      total_attempts = prev_attempts + fails_this_run
+
+      with open("attempt_count.txt", "w", encoding="utf-8") as f:
+          f.write(str(total_attempts))
+
+      print(f"Fails this run: {fails_this_run}")
+      print(f"Total failed attempts: {total_attempts}")
+
+      success_markers = [
+          "Instance created",
+          "Created instance",
+          "created successfully",
+          "Instance OCID",
+      ]
+
+      success = any(marker.lower() in log.lower() for marker in success_markers)
+
+      if not success:
+          raise SystemExit(0)
+
+      with open("instance_created.flag", "w", encoding="utf-8") as f:
+          f.write("created\n")
+
+      ip_match = re.search(r"(?:Public IP|PublicIp|IP)[:= ]+([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)", log)
+      public_ip = ip_match.group(1) if ip_match else "unknown"
+
+      cfg = configparser.ConfigParser()
+      cfg.read("configuration.ini")
+
+      bot_token = cfg.get("Telegram", "bot_token", fallback="").strip()
+      tg_uid = cfg.get("Telegram", "uid", fallback="").strip()
+
+      message = (
+          "🎉 Oracle A1 created!\n\n"
+          f"Failed attempts before success: {total_attempts}\n"
+          f"Successful attempt number: {total_attempts + 1}\n"
+          f"Approx hunting time: ~{total_attempts} minutes\n"
+          f"Public IP: {public_ip}\n\n"
+          "Now disable GitHub Actions workflow."
+      )
+
+      if bot_token and ":" in bot_token and tg_uid and tg_uid != "xxxx":
+          url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+          data = urllib.parse.urlencode({
+              "chat_id": tg_uid,
+              "text": message,
+          }).encode("utf-8")
+
+          try:
+              with urllib.request.urlopen(url, data=data, timeout=20) as response:
+                  print("Telegram report sent:", response.status)
+          except Exception as e:
+              print("Telegram report failed:", repr(e))
+      else:
+          print("Telegram token or uid is missing/invalid, report not sent.")
+      PY
+
+  - name: Commit attempt counter
+    if: steps.done.outputs.created != 'true'
+    run: |
+      git config user.name "github-actions[bot]"
+      git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      git add attempt_count.txt
+
+      if [ -f instance_created.flag ]; then
+        git add instance_created.flag
+      fi
+
+      if git diff --cached --quiet; then
+        echo "No counter changes to commit."
+      else
+        git commit -m "Update Oracle A1 attempt counter"
+        git pull --rebase
+        git push
+      fi
+
+  - name: Fail if bot crashed
+    if: steps.done.outputs.created != 'true'
+    run: |
+      if [ "$BOT_EXIT_CODE" != "0" ] && [ "$BOT_EXIT_CODE" != "124" ]; then
+        echo "Bot crashed with code $BOT_EXIT_CODE"
+        exit "$BOT_EXIT_CODE"
+      fi
