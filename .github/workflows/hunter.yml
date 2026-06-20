@@ -1,0 +1,35 @@
+name: Oracle A1 Hunter
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "7 */5 * * *"
+
+concurrency:
+  group: oracle-a1-hunter
+  cancel-in-progress: false
+
+jobs:
+  hunt:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Write config files
+        run: |
+          printf '%s' "${{ secrets.OCI_CONFIG }}" > config
+          printf '%s' "${{ secrets.OCI_PRIVATE_KEY }}" > oci_private_key.pem
+          printf '%s' "${{ secrets.CONFIGURATION_INI }}" > configuration.ini
+          chmod 600 oci_private_key.pem
+
+      - name: Run hunter
+        run: python3 bot.py
