@@ -3,7 +3,7 @@ name: Oracle A1 Hunter
 on:
   workflow_dispatch:
   schedule:
-    - cron: "7 */5 * * *"
+    - cron: "7 */6 * * *"
 
 concurrency:
   group: oracle-a1-hunter
@@ -12,7 +12,7 @@ concurrency:
 jobs:
   hunt:
     runs-on: ubuntu-latest
-    timeout-minutes: 340
+    timeout-minutes: 355
 
     steps:
       - uses: actions/checkout@v4
@@ -25,10 +25,14 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Write config files
+        env:
+          OCI_CONFIG_SECRET: ${{ secrets.OCI_CONFIG }}
+          OCI_PRIVATE_KEY_SECRET: ${{ secrets.OCI_PRIVATE_KEY }}
+          CONFIGURATION_INI_SECRET: ${{ secrets.CONFIGURATION_INI }}
         run: |
-          printf '%s' "${{ secrets.OCI_CONFIG }}" > config
-          printf '%s' "${{ secrets.OCI_PRIVATE_KEY }}" > oci_private_key.pem
-          printf '%s' "${{ secrets.CONFIGURATION_INI }}" > configuration.ini
+          printf '%s\n' "$OCI_CONFIG_SECRET" > config
+          printf '%s\n' "$OCI_PRIVATE_KEY_SECRET" > oci_private_key.pem
+          printf '%s\n' "$CONFIGURATION_INI_SECRET" > configuration.ini
           chmod 600 oci_private_key.pem
 
       - name: Debug availability_domains
