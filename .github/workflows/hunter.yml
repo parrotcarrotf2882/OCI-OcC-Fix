@@ -24,12 +24,23 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Write config files
+            - name: Write config files
         run: |
           printf '%s' "${{ secrets.OCI_CONFIG }}" > config
           printf '%s' "${{ secrets.OCI_PRIVATE_KEY }}" > oci_private_key.pem
           printf '%s' "${{ secrets.CONFIGURATION_INI }}" > configuration.ini
           chmod 600 oci_private_key.pem
+
+      - name: Debug availability_domains
+        run: |
+          python3 - <<'PY'
+          import configparser, json
+          cfg = configparser.ConfigParser()
+          cfg.read("configuration.ini")
+          v = cfg.get("OCI", "availability_domains")
+          print("availability_domains repr:", repr(v))
+          print("availability_domains parsed:", json.loads(v))
+          PY
 
       - name: Run hunter
         run: python3 bot.py
