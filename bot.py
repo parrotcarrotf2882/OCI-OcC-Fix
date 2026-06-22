@@ -6,6 +6,7 @@ GitHub: https://github.com/mosesman831/OCI-OcC-Fix
 """
 
 import argparse
+import os
 import oci
 import logging
 import time
@@ -49,7 +50,12 @@ class OciOccFix:
         self.tg_bot = self.initialize_telegram()
         
         # Phase 5: Runtime state
-        self.total_retries = 0
+        try: 
+            self.total_retries = max( 
+                0,
+                int(os.environ.get("PREV_ATTEMPTS", "0")) 
+        ) 
+            except ValueError: self.total_retries = 0
         self.retry_counter = 0
 
     @staticmethod
