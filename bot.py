@@ -49,14 +49,19 @@ class OciOccFix:
         self.tg_message_id = None
         self.tg_bot = self.initialize_telegram()
         
-        # Phase 5: Runtime state
-        try: 
-            self.total_retries = max( 
+
+       # Phase 5: Runtime state
+        try:
+            self.total_retries = max(
                 0,
-                int(os.environ.get("PREV_ATTEMPTS", "0")) 
-        ) 
-            except ValueError: self.total_retries = 0
+                int(os.environ.get("PREV_ATTEMPTS", "0"))
+            )
+        except ValueError:
+            self.total_retries = 0
+
         self.retry_counter = 0
+
+
 
     @staticmethod
     def load_config(config_path: Path) -> configparser.ConfigParser:
