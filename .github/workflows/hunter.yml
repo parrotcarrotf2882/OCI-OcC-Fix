@@ -154,6 +154,22 @@ jobs:
       - name: Commit attempt counter
         if: steps.done.outputs.created != 'true'
         run: |
+          cp attempt_count.txt /tmp/attempt_count.txt
+
+          if [ -f instance_created.flag ]; then
+            cp instance_created.flag /tmp/instance_created.flag
+          fi
+
+          # Remove temporary files and secret-backed config changes.
+          git reset --hard HEAD
+          git clean -fd
+
+          cp /tmp/attempt_count.txt attempt_count.txt
+
+          if [ -f /tmp/instance_created.flag ]; then
+            cp /tmp/instance_created.flag instance_created.flag
+          fi
+
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
@@ -167,8 +183,8 @@ jobs:
             echo "No counter changes to commit."
           else
             git commit -m "Update Oracle A1 attempt counter"
-            git pull --rebase
-            git push
+            git pull --rebase origin "$GITHUB_REF_NAME"
+            git push origin HEAD:"$GITHUB_REF_NAME"
           fi
 
       - name: Fail if bot crashed
