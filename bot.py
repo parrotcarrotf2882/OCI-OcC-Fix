@@ -26,42 +26,83 @@ LOG_FILE = 'oci_occ.log'
 MAX_LOG_SIZE = 5 * 1024 * 1024  # 5 MB
 LOG_BACKUP_COUNT = 3
 RETRYABLE_ERROR_CODES = {"TooManyRequests", "OutOfHostCapacity", "OutOfCapacity"}
+ATTEMPT_COUNT_FILE = Path(os.environ.get("ATTEMPT_COUNT_FILE", "attempt_count.txt"))
 
 class OciOccFix:
     def __init__(self, config_path: Path, oci_config_path: Path):
         self.config_path = config_path
         self.oci_config_path = oci_config_path
+        self.attempt_count_path = ATTEMPT_COUNT_FILE
+
         # Phase 1: Core configuration
         self.config = self.load_config(self.config_path)
         self.setup_logging()
-        
-        # Phase 2: Initialize critical parameters first
+
+        # Phase 2: Retry timing
         self.wait_seconds = self.config.getint(
-            'Retry', 
+            'Retry',
             'initial_retry_interval',
-            fallback=1
+            fallback=20
         )
-        
-        # Phase 3: Service clients
+
+        # Phase 3: OCI clients
         self.clients = self.initialize_oci_clients()
-        
-        # Phase 4: Telegram integration
-        self.tg_message_id = None
-        self.tg_bot = self.initialize_telegram()
-        
 
-       # Phase 5: Runtime state
-        try:
-            self.total_retries = max(
-                0,
-                int(os.environ.get("PREV_ATTEMPTS", "0"))
-            )
-        except ValueError:
-            self.total_retries = 0
-
+        # Phase 4: Persistent runtime state
+        self.total_retries = self.load_attempt_count()
         self.retry_counter = 0
 
+        # Phase 5: Telegram integration
+        self.tg_message_id = None
+        self.tg_bot = self.initialize_telegram()
 
+    @staticmethod
+    def _parse_nonnegative_int(value: object) -> Optional[int]:
+        try:
+            parsed = int(str(value).strip())
+        except (TypeError, ValueError):
+            return None
+        return max(0, parsed)
+
+    def load_attempt_count(self) -> int:
+        """Load the largest valid counter from the environment or state file."""
+        candidates: List[int] = []
+
+        env_value = self._parse_nonnegative_int(
+            os.environ.get("PREV_ATTEMPTS")
+        )
+        if env_value is not None:
+            candidates.append(env_value)
+
+        try:
+            if self.attempt_count_path.exists():
+                file_value = self._parse_nonnegative_int(
+                    self.attempt_count_path.read_text(
+                        encoding="utf-8"
+                    )
+                )
+                if file_value is not None:
+                    candidates.append(file_value)
+        except OSError as exc:
+            logging.warning(f"Could not read attempt counter: {exc}")
+
+        count = max(candidates, default=0)
+        logging.info(f"Loaded previous failed attempts: {count}")
+        return count
+
+    def persist_attempt_count(self) -> None:
+        """Atomically save the failed-attempt counter for the workflow."""
+        temp_path = self.attempt_count_path.with_suffix(
+            self.attempt_count_path.suffix + ".tmp"
+        )
+        try:
+            temp_path.write_text(
+                str(self.total_retries) + "\n",
+                encoding="utf-8"
+            )
+            temp_path.replace(self.attempt_count_path)
+        except OSError as exc:
+            logging.warning(f"Could not save attempt counter: {exc}")
 
     @staticmethod
     def load_config(config_path: Path) -> configparser.ConfigParser:
@@ -164,6 +205,7 @@ class OciOccFix:
                 f"• User: {users[0].email if users else 'Unknown'}\n"
                 f"• Time: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
                 f"• Retry Interval: {self.wait_seconds}s\n"
+                f"• Previous failed attempts: {self.total_retries}\n"
                 f"• Machine: {self.config.get('Machine', 'shape')}"
             )
             
@@ -202,7 +244,7 @@ class OciOccFix:
             required_size = self.config.getint(
                 'Instance', 
                 'boot_volume_size', 
-                fallback=47
+                fallback=50
             )
             if (200 - total_storage) < required_size:
                 logging.critical(
@@ -294,43 +336,102 @@ class OciOccFix:
             boot_volume_size_in_gbs=self.config.getint(
                 'Instance', 
                 'boot_volume_size',
-                fallback=47
+                fallback=50
             )
         )
 
-    def handle_success(self, instance_id: str):
-        """Handle successful creation with IP retrieval"""
-        try:
-            vnic = self.clients['compute'].list_vnic_attachments(
-                compartment_id=self.config.get('OCI', 'compartment_id'),
-                instance_id=instance_id
-            ).data[0]
+    def get_public_ip_with_retry(
+        self,
+        instance_id: str,
+        attempts: int = 18,
+        delay_seconds: int = 5
+    ) -> str:
+        """Wait for the VNIC and public IP to become available."""
+        for attempt in range(1, attempts + 1):
+            try:
+                attachments = self.clients['compute'].list_vnic_attachments(
+                    compartment_id=self.config.get('OCI', 'compartment_id'),
+                    instance_id=instance_id
+                ).data
 
-            private_ip = self.clients['network'].list_private_ips(
-                vnic_id=vnic.vnic_id
-            ).data[0].id
+                if not attachments:
+                    raise RuntimeError("VNIC attachment is not ready")
 
-            public_ip = self.clients['network'].get_public_ip_by_private_ip_id(
-                oci.core.models.GetPublicIpByPrivateIpIdDetails(
-                    private_ip_id=private_ip
+                private_ips = self.clients['network'].list_private_ips(
+                    vnic_id=attachments[0].vnic_id
+                ).data
+
+                if not private_ips:
+                    raise RuntimeError("Private IP is not ready")
+
+                public_ip = self.clients['network'].get_public_ip_by_private_ip_id(
+                    oci.core.models.GetPublicIpByPrivateIpIdDetails(
+                        private_ip_id=private_ips[0].id
+                    )
+                ).data.ip_address
+
+                if public_ip:
+                    return public_ip
+
+            except Exception as exc:
+                logging.info(
+                    f"Waiting for public IP ({attempt}/{attempts}): {exc}"
                 )
-            ).data.ip_address
 
-            logging.info(f"✅ Instance created! Public IP: {public_ip}")
-            self.send_telegram_update(
-                f"🚀 Instance Ready!\n"
-                f"• IP: {public_ip}\n"
-                f"• Retries: {self.total_retries}\n"
-                f"• Time: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}"
-            )
-            sys.exit(0)
+            if attempt < attempts:
+                time.sleep(delay_seconds)
 
-        except Exception as e:
-            logging.error(f"Success handling failed: {str(e)}")
-            sys.exit(1)
+        return "pending"
+
+    def send_telegram_success(self, message: str) -> None:
+        """Send a separate success message with retries."""
+        if not self.tg_bot:
+            return
+
+        chat_id = self.config.get('Telegram', 'uid')
+        last_error = None
+
+        for attempt in range(1, 4):
+            try:
+                self.tg_bot.send_message(chat_id, message)
+                logging.info("Telegram success notification sent")
+                return
+            except Exception as exc:
+                last_error = exc
+                logging.warning(
+                    f"Telegram success notification attempt "
+                    f"{attempt}/3 failed: {exc}"
+                )
+                if attempt < 3:
+                    time.sleep(5)
+
+        logging.error(
+            f"Telegram success notification completely failed: {last_error}"
+        )
+
+    def handle_success(self, instance_id: str):
+        """Persist success immediately, retrieve IP, then notify Telegram."""
+        Path("instance_created.flag").write_text(
+            instance_id + "\n",
+            encoding="utf-8"
+        )
+        self.persist_attempt_count()
+
+        public_ip = self.get_public_ip_with_retry(instance_id)
+
+        logging.info(f"✅ Instance created! Public IP: {public_ip}")
+        self.send_telegram_success(
+            "🚀 Instance Ready!\n"
+            f"• IP: {public_ip}\n"
+            f"• Failed attempts before success: {self.total_retries}\n"
+            f"• Successful attempt number: {self.total_retries + 1}\n"
+            f"• Time: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
+            "• Disable the GitHub Actions workflow now."
+        )
+        sys.exit(0)
 
     def send_telegram_update(self, message: str):
-        """Update Telegram message with error handling"""
+        """Update the current Telegram status message."""
         if not self.tg_bot or not self.tg_message_id:
             return
 
@@ -340,8 +441,8 @@ class OciOccFix:
                 message_id=self.tg_message_id,
                 text=message
             )
-        except Exception as e:
-            logging.warning(f"Telegram update failed: {str(e)}")
+        except Exception as exc:
+            logging.warning(f"Telegram update failed: {exc}")
 
     def adaptive_retry_wait(self, error_code: str):
         """Adjust retry timing with bounds checking"""
@@ -365,23 +466,30 @@ class OciOccFix:
         logging.info(f"⏳ Next retry in {self.wait_seconds:.1f}s")
 
     def run(self):
-        """Main execution loop with enhanced error handling"""
+        """Main execution loop with a persistent failed-attempt counter."""
         if not self.validate_resources():
             logging.critical("❌ Resource validation failed")
             sys.exit(1)
 
         ads = json.loads(self.config.get('OCI', 'availability_domains'))
-        
+
         while True:
             try:
                 for ad in ads:
-                    self.total_retries += 1
+                    attempt_number = self.total_retries + 1
+                    logging.info(
+                        f"Trying attempt {attempt_number} in {ad}"
+                    )
+
                     instance_id = self.create_instance(ad)
-                    
+
                     if instance_id:
                         self.handle_success(instance_id)
-                    
-                    # Update status every 10 attempts
+
+                    # Only failed launch requests are added to the counter.
+                    self.total_retries += 1
+                    self.persist_attempt_count()
+
                     if self.total_retries % 10 == 0 and self.tg_bot:
                         self.send_telegram_update(
                             f"🔁 Attempt {self.total_retries}\n"
@@ -392,12 +500,15 @@ class OciOccFix:
                     time.sleep(self.wait_seconds)
 
             except KeyboardInterrupt:
+                self.persist_attempt_count()
                 logging.info("🛑 Process interrupted by user")
                 self.send_telegram_update("🛑 Process interrupted by user")
                 sys.exit(0)
-            except Exception as e:
-                error_code = getattr(e, 'code', 'Unknown')
-                logging.error(f"⚠️ Unexpected error: {str(e)}")
+
+            except Exception as exc:
+                self.persist_attempt_count()
+                error_code = getattr(exc, 'code', 'Unknown')
+                logging.error(f"⚠️ Unexpected error: {exc}")
                 self.adaptive_retry_wait(error_code)
                 time.sleep(self.wait_seconds)
 
