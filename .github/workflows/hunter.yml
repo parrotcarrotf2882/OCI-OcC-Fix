@@ -73,85 +73,124 @@ jobs:
           echo "Bot exit code: $CODE"
           exit 0
 
-      - name: Update counter and notify
+      - name: Finalize state and fallback notification
         if: steps.done.outputs.created != 'true'
-        env:
-          PREV_ATTEMPTS: ${{ env.PREV_ATTEMPTS }}
         run: |
           python3 - <<'PY'
           import configparser
-          import os
           import re
+          import time
           import urllib.parse
           import urllib.request
+          from pathlib import Path
 
-          prev_attempts = int(os.environ.get("PREV_ATTEMPTS", "0"))
+          counter_path = Path("attempt_count.txt")
 
           try:
-              with open("bot_run.log", "r", encoding="utf-8", errors="replace") as f:
-                  log = f.read()
+              total_attempts = max(
+                  0,
+                  int(counter_path.read_text(encoding="utf-8").strip())
+              )
+          except (FileNotFoundError, ValueError):
+              total_attempts = 0
+              counter_path.write_text("0\n", encoding="utf-8")
+
+          try:
+              log = Path("bot_run.log").read_text(
+                  encoding="utf-8",
+                  errors="replace"
+              )
           except FileNotFoundError:
               log = ""
 
-          fails_this_run = log.count("Create failed in")
-          total_attempts = prev_attempts + fails_this_run
+          print(f"Persistent failed attempts: {total_attempts}")
 
-          with open("attempt_count.txt", "w", encoding="utf-8") as f:
-              f.write(str(total_attempts))
-
-          print(f"Fails this run: {fails_this_run}")
-          print(f"Total failed attempts: {total_attempts}")
-
-          success_markers = [
-              "Instance created",
-              "Created instance",
-              "created successfully",
-              "Instance OCID",
-          ]
-
-          success = any(marker.lower() in log.lower() for marker in success_markers)
-
-          if not success:
+          flag_path = Path("instance_created.flag")
+          if not flag_path.exists():
               raise SystemExit(0)
 
-          with open("instance_created.flag", "w", encoding="utf-8") as f:
-              f.write("created\n")
+          if "Telegram success notification sent" in log:
+              print("Bot already sent the success notification.")
+              raise SystemExit(0)
 
-          ip_match = re.search(r"(?:Public IP|PublicIp|IP)[:= ]+([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)", log)
-          public_ip = ip_match.group(1) if ip_match else "unknown"
+          ip_match = re.search(
+              r"Public IP:\s*"
+              r"([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+|pending)",
+              log,
+          )
+          public_ip = ip_match.group(1) if ip_match else "pending"
 
           cfg = configparser.ConfigParser()
           cfg.read("configuration.ini")
 
-          bot_token = cfg.get("Telegram", "bot_token", fallback="").strip()
-          tg_uid = cfg.get("Telegram", "uid", fallback="").strip()
+          bot_token = cfg.get(
+              "Telegram",
+              "bot_token",
+              fallback="",
+          ).strip()
+          tg_uid = cfg.get(
+              "Telegram",
+              "uid",
+              fallback="",
+          ).strip()
+
+          if not bot_token or ":" not in bot_token:
+              print("Telegram token is missing or invalid.")
+              raise SystemExit(0)
+
+          if not tg_uid or tg_uid == "xxxx":
+              print("Telegram UID is missing or invalid.")
+              raise SystemExit(0)
 
           message = (
               "🎉 Oracle A1 created!\n\n"
               f"Failed attempts before success: {total_attempts}\n"
               f"Successful attempt number: {total_attempts + 1}\n"
-              f"Approx hunting time: ~{total_attempts} minutes\n"
               f"Public IP: {public_ip}\n\n"
-              "Now disable GitHub Actions workflow."
+              "Disable the GitHub Actions workflow now."
           )
 
-          if bot_token and ":" in bot_token and tg_uid and tg_uid != "xxxx":
-              url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-              data = urllib.parse.urlencode({
-                  "chat_id": tg_uid,
-                  "text": message,
-              }).encode("utf-8")
+          url = (
+              f"https://api.telegram.org/"
+              f"bot{bot_token}/sendMessage"
+          )
+          data = urllib.parse.urlencode({
+              "chat_id": tg_uid,
+              "text": message,
+          }).encode("utf-8")
 
+          last_error = None
+
+          for attempt in range(1, 4):
               try:
-                  with urllib.request.urlopen(url, data=data, timeout=20) as response:
-                      print("Telegram report sent:", response.status)
-              except Exception as e:
-                  print("Telegram report failed:", repr(e))
+                  with urllib.request.urlopen(
+                      url,
+                      data=data,
+                      timeout=30,
+                  ) as response:
+                      print(
+                          "Telegram fallback report sent:",
+                          response.status,
+                      )
+                  break
+              except Exception as exc:
+                  last_error = exc
+                  print(
+                      f"Telegram fallback attempt "
+                      f"{attempt}/3 failed:",
+                      repr(exc),
+                  )
+
+                  if attempt < 3:
+                      time.sleep(5)
           else:
-              print("Telegram token or uid is missing/invalid, report not sent.")
+              print(
+                  "Telegram fallback report completely failed:",
+                  repr(last_error),
+              )
           PY
 
-      - name: Commit attempt counter
+      - name: Commit persistent state
         if: steps.done.outputs.created != 'true'
         run: |
           cp attempt_count.txt /tmp/attempt_count.txt
@@ -160,8 +199,8 @@ jobs:
             cp instance_created.flag /tmp/instance_created.flag
           fi
 
-          # Remove temporary files and secret-backed config changes.
-          git reset --hard HEAD
+          git fetch origin "$GITHUB_REF_NAME"
+          git reset --hard "origin/$GITHUB_REF_NAME"
           git clean -fd
 
           cp /tmp/attempt_count.txt attempt_count.txt
@@ -180,10 +219,9 @@ jobs:
           fi
 
           if git diff --cached --quiet; then
-            echo "No counter changes to commit."
+            echo "No state changes to commit."
           else
-            git commit -m "Update Oracle A1 attempt counter"
-            git pull --rebase origin "$GITHUB_REF_NAME"
+            git commit -m "Update Oracle A1 hunter state"
             git push origin HEAD:"$GITHUB_REF_NAME"
           fi
 
