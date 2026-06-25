@@ -311,12 +311,27 @@ class OciOccFix:
             return response.data.id
         except oci.exceptions.ServiceError as e:
             error_code = e.code
+            error_message = str(e.message or "")
             error_code_display = error_code or 'UnknownServiceError'
             logging.warning(
-                f"Create failed in {availability_domain}: {error_code_display} - {e.message}"
+                f"Create failed in {availability_domain}: "
+                f"{error_code_display} - {error_message}"
             )
-            if error_code in RETRYABLE_ERROR_CODES:
-                self.adaptive_retry_wait(error_code)
+
+            normalized_error = error_code
+            lowered_message = error_message.lower()
+
+            # OCI sometimes returns capacity exhaustion as InternalError
+            # while the useful reason is only present in the message text.
+            if (
+                "out of host capacity" in lowered_message
+                or "out of capacity" in lowered_message
+            ):
+                normalized_error = "OutOfHostCapacity"
+
+            if normalized_error in RETRYABLE_ERROR_CODES:
+                self.adaptive_retry_wait(normalized_error)
+
             return None
         except Exception as e:
             logging.error(f"Unexpected creation error: {str(e)}")
